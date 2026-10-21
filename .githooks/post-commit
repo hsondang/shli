@@ -1,0 +1,15 @@
+#!/bin/sh
+# Deploys the committed shli.sh (not unsaved edits) to ~/.mylib/shli.sh after every commit.
+dest="$HOME/.mylib/shli.sh"
+if ! git cat-file -e HEAD:shli.sh 2>/dev/null; then
+  echo "shli: no shli.sh in HEAD, nothing deployed"
+  exit 0
+fi
+hash=$(git rev-parse --short HEAD)
+mkdir -p "$(dirname "$dest")"
+tmp="$dest.tmp.$$"
+{
+  echo "# shli $hash — deployed from $(git rev-parse --show-toplevel), edit there"
+  git show HEAD:shli.sh
+} > "$tmp" && mv "$tmp" "$dest" || { rm -f "$tmp"; echo "shli: deploy failed" >&2; exit 1; }
+echo "shli: deployed $hash to $dest"

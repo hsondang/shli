@@ -1,0 +1,116 @@
+#!/usr/bin/expect -f
+# Smoke test: drives shli in a real terminal, pressing ⏎ / esc / arrow keys like a person would.
+# Makes real Claude calls (about 5 s each, 5 calls). Runs inside an empty temp folder.
+# Usage: test/smoke.exp [shell]    e.g. test/smoke.exp zsh    test/smoke.exp /bin/bash
+
+set shell [expr {[llength $argv] ? [lindex $argv 0] : "zsh"}]
+set src [file dirname [file dirname [file normalize [info script]]]]/shli.sh
+set sandbox [exec mktemp -d]
+set timeout 40
+set prompt "SHLI-TEST> "
+
+proc fail {msg} { puts "\n\033\[31mFAIL: $msg\033\[0m"; exit 1 }
+proc pass {msg} { puts "\n\033\[32mPASS: $msg\033\[0m" }
+
+proc wait_prompt {} {
+  global prompt
+  expect {
+    $prompt {}
+    timeout { fail "shell prompt never came back" }
+  }
+}
+
+# Sends a request and waits for the proposal; returns everything shli printed for it.
+proc ask {request} {
+  send "shli $request\r"
+  expect {
+    "esc cancel" {}
+    "no matches found" { fail "zsh treated the request as a glob: $request" }
+    "shli: no command" { fail "claude returned no command for: $request" }
+    timeout { fail "no proposal for: $request" }
+  }
+  return $expect_out(buffer)
+}
+
+if {[string match *zsh* $shell]} {
+  spawn -noecho $shell -f -i
+} else {
+  spawn -noecho $shell --norc --noprofile -i
+}
+# Prompt is split in the source so expect only matches the real prompt, not the echoed command.
+send "PS1='SHLI-''TEST> '; cd '$sandbox' && source '$src'\r"
+wait_prompt
+
+# 1. Plain request, run with ⏎.
+ask "check my kernel and os version"
+send "\r"
+expect {
+  -re {Darwin|ProductVersion|Linux} {}
+  timeout { fail "kernel command produced no kernel/OS output" }
+}
+wait_prompt
+pass "kernel request ran on ⏎"
+
+# 2. The command runs in this shell, so cd sticks.
+ask "go to the Downloads folder in my home directory"
+send "\r"
+wait_prompt
+send "pwd\r"
+expect {
+  "/Downloads" {}
+  timeout { fail "cd did not change the shell's directory" }
+}
+wait_prompt
+send "cd '$sandbox'\r"
+wait_prompt
+pass "cd ran in the current shell"
+
+# 3. Unquoted "?" works, esc cancels.
+ask "what is my local ip?"
+send "\033"
+expect {
+  "cancelled" {}
+  timeout { fail "esc did not cancel" }
+}
+wait_prompt
+pass "unquoted ? accepted, esc cancelled"
+
+# 4. Destructive command: ⏎ does nothing, esc cancels. Sandbox is empty, so nothing is at stake.
+set shown [ask "delete all .log files in this folder"]
+if {![string match *destructive* $shown]} { fail "delete request was not flagged as destructive" }
+send "\r"
+set timeout 3
+expect {
+  $prompt { fail "⏎ ran a destructive command" }
+  timeout {}
+}
+set timeout 40
+send "\033"
+expect {
+  "cancelled" {}
+  timeout { fail "esc did not cancel the destructive command" }
+}
+wait_prompt
+pass "destructive command needed y, ⏎ ignored"
+
+# 5. An arrow key cancels without leaking "[A" into the next command line.
+ask "show disk usage of this folder"
+send "\033\[A"
+expect {
+  "cancelled" {}
+  timeout { fail "arrow key did not cancel" }
+}
+wait_prompt
+send "echo after-\$((1+1))\r"
+expect {
+  "after-2" {}
+  -re {not found|bad pattern|syntax error} { fail "arrow key bytes leaked into the prompt" }
+  timeout { fail "shell did not respond after arrow key" }
+}
+wait_prompt
+pass "arrow key cancelled cleanly"
+
+send "exit\r"
+expect eof
+file delete -force $sandbox
+puts "\n\033\[32mall passed ($shell)\033\[0m"
