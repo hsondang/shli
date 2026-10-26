@@ -24,5 +24,5 @@ if [ "$(git config core.hooksPath)" = .githooks ]; then
 fi
 
 echo "shli: tabs that are already open still have it loaded; to unload there:"
-echo "  zsh:  unalias shli; unfunction _shli _shli_prog _shli_readkey _shli_drain"
-echo "  bash: unset -f shli _shli _shli_prog _shli_readkey _shli_drain"
+echo "  zsh:  unalias shli; unfunction -m '_shli*'"
+echo "  bash: unset -f shli \$(compgen -A function _shli)"

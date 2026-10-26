@@ -1,0 +1,129 @@
+#!/usr/bin/expect -f
+# Offline test of the retry flow, with no real Claude calls: a fake claude hands out canned answers
+# and saves what shli sent it, so the test can check what a retry sends and to which model. Takes about 25 s.
+# Usage: test/followup.exp [shell]    e.g. test/followup.exp zsh    test/followup.exp /bin/bash
+
+set shell [expr {[llength $argv] ? [lindex $argv 0] : "zsh"}]
+set src [file dirname [file dirname [file normalize [info script]]]]/shli.sh
+set sandbox [exec mktemp -d]
+set timeout 15
+set prompt "SHLI-TEST> "
+
+proc fail {msg} { puts "\n\033\[31mFAIL: $msg\033\[0m"; exit 1 }
+proc pass {msg} { puts "\n\033\[32mPASS: $msg\033\[0m" }
+proc wait_prompt {} {
+  global prompt
+  expect {
+    $prompt {}
+    timeout { fail "shell prompt never came back" }
+  }
+}
+proc expect_text {text why} {
+  expect {
+    $text {}
+    timeout { fail $why }
+  }
+}
+proc file_has {path text why} {
+  if {[catch {set f [open $path]}]} { fail "$why ($path missing)" }
+  set body [read $f]
+  close $f
+  if {[string first $text $body] < 0} { fail "$why: no \"$text\" in [file tail $path]" }
+}
+proc line_count {path} {
+  if {![file exists $path]} { return 0 }
+  return [llength [split [string trim [exec cat $path]] "\n"]]
+}
+
+# Fake claude: answer N is line N of $sandbox/answers; what shli sent is saved as $sandbox/request.N,
+# and its arguments, one per line, as $sandbox/args.N.
+file mkdir $sandbox/bin
+set f [open $sandbox/bin/claude w]
+puts $f {#!/bin/sh
+d=$(dirname "$0")/..
+n=$(( $(cat "$d/calls" 2>/dev/null || echo 0) + 1 ))
+echo $n > "$d/calls"
+printf '%s\n' "$@" > "$d/args.$n"
+cat > "$d/request.$n"
+sleep 1.2  # long enough for one spinner frame even on bash 3.2, which ticks once a second
+printf '{"is_error":false,"structured_output":%s}\n' "$(sed -n "${n}p" "$d/answers")"}
+close $f
+file attributes $sandbox/bin/claude -permissions 0755
+set f [open $sandbox/answers w]
+puts $f {{"cmd":"echo SSID: none; echo ran >> safe-runs","explain":"Prints the network name","risk":"safe"}}
+puts $f {{"cmd":"echo SSID: home","explain":"Prints the network name another way","risk":"safe"}}
+puts $f {{"cmd":"echo changed >> caution-runs; (exit 3)","explain":"Changes a file","risk":"caution"}}
+puts $f {{"cmd":"echo second try","explain":"Prints something","risk":"safe"}}
+puts $f {{"cmd":"echo timed","explain":"Prints something","risk":"safe"}}
+close $f
+
+if {[string match *zsh* $shell]} {
+  spawn -noecho $shell -f -i
+} else {
+  spawn -noecho $shell --norc --noprofile -i
+}
+send "PS1='SHLI-''TEST> '; cd '$sandbox' && PATH='$sandbox/bin':\$PATH && source '$src'\r"
+wait_prompt
+
+# 1. Type what's wrong: a read-only command is re-run to read its output, and everything goes back to Haiku.
+send "shli what wifi am I on\r"
+expect_text "esc cancel" "no first proposal"
+send "\r"
+expect_text "Not right?" "no retry offer after the command ran"
+send "I am on wifi\r"
+expect_text "Asking Sonnet" "the retry spinner should say it is asking Sonnet"
+expect_text "esc cancel" "no second proposal after typing feedback"
+send "\r"
+expect_text "SSID: home" "second command did not run"
+expect_text "Not right?" "no retry offer after the second command"
+send "\033"
+wait_prompt
+file_has $sandbox/request.2 "Request: what wifi am I on" "retry lost the original request"
+file_has $sandbox/request.2 "Command: echo SSID: none; echo ran >> safe-runs" "retry lost the failed command"
+file_has $sandbox/request.2 "Output:\nSSID: none" "retry lost the command's output"
+file_has $sandbox/request.2 "Exit code: 0" "retry lost the exit code"
+file_has $sandbox/request.2 "What the user says is wrong: I am on wifi" "retry lost what the user typed"
+if {[line_count $sandbox/safe-runs] != 2} { fail "read-only command ran [line_count $sandbox/safe-runs] times, expected 2 (run + re-run)" }
+file_has $sandbox/args.1 "--model\nhaiku" "the first ask should use Haiku"
+file_has $sandbox/args.2 "--model\nsonnet" "a retry should use Sonnet"
+pass "typed feedback, the output and the exit code went to Sonnet on the retry"
+
+# 2. ⏎ alone retries; a command that changes things is not run again; SHLI_RETRY_MODEL picks the retry model.
+send "SHLI_RETRY_MODEL=opus\r"
+wait_prompt
+send "shli change a file\r"
+expect_text "esc cancel" "no proposal"
+send "\r"
+expect_text "Not right?" "no retry offer"
+send "\r"
+expect_text "Asking Opus" "SHLI_RETRY_MODEL=opus should show Asking Opus"
+expect_text "esc cancel" "⏎ did not retry"
+send "\033"
+expect_text "cancelled" "esc did not cancel the retry proposal"
+wait_prompt
+file_has $sandbox/request.4 "not captured" "a command that changes things should not be re-run"
+file_has $sandbox/request.4 "Exit code: 3" "retry lost the non-zero exit code"
+file_has $sandbox/request.4 "(nothing more" "⏎-only retry should say the user added nothing"
+if {[line_count $sandbox/caution-runs] != 1} { fail "a command that changes things ran [line_count $sandbox/caution-runs] times, expected 1" }
+file_has $sandbox/args.3 "--model\nhaiku" "a new request should start with Haiku again"
+file_has $sandbox/args.4 "--model\nopus" "SHLI_RETRY_MODEL=opus should send the retry to opus"
+pass "⏎ retried with SHLI_RETRY_MODEL, and the changing command was not re-run"
+
+# 3. With no answer, the offer counts down and ends by itself.
+send "SHLI_FOLLOWUP_SECONDS=2\r"
+wait_prompt
+send "shli say timed\r"
+expect_text "esc cancel" "no proposal"
+send "\r"
+expect_text "(2s)" "no countdown"
+expect_text "(1s)" "countdown did not tick"
+set timeout 4
+wait_prompt
+set timeout 15
+if {[string trim [exec cat $sandbox/calls]] != 5} { fail "a timeout should not call claude again" }
+pass "retry offer ended by itself after the countdown"
+
+send "exit\r"
+expect eof
+file delete -force $sandbox
+puts "\n\033\[32mall passed ($shell)\033\[0m"

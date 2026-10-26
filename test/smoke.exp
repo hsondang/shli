@@ -1,6 +1,7 @@
 #!/usr/bin/expect -f
 # Smoke test: drives shli in a real terminal, pressing ⏎ / esc / arrow keys like a person would.
-# Makes real Claude calls (about 5 s each, 5 calls). Runs inside an empty temp folder.
+# Makes real Claude calls (about 5 s each, 8 calls). Runs inside an empty temp folder.
+# The retry flow is covered offline by test/followup.exp.
 # Usage: test/smoke.exp [shell]    e.g. test/smoke.exp zsh    test/smoke.exp /bin/bash
 
 set shell [expr {[llength $argv] ? [lindex $argv 0] : "zsh"}]
@@ -21,15 +22,27 @@ proc wait_prompt {} {
 }
 
 # Sends a request and waits for the proposal; returns everything shli printed for it.
+# After a command runs, shli offers a retry for 30 s; esc ends that so the prompt comes back.
+proc end_followup {} {
+  expect {
+    "Not right?" {}
+    timeout { fail "no retry offer after the command ran" }
+  }
+  send "\033"
+}
+
 proc ask {request} {
   send "shli $request\r"
   expect {
     "esc cancel" {}
     "no matches found" { fail "zsh treated the request as a glob: $request" }
-    "shli: no command" { fail "claude returned no command for: $request" }
+    "shli: no answer" { fail "claude returned no command for: $request" }
     timeout { fail "no proposal for: $request" }
   }
-  return $expect_out(buffer)
+  set shown $expect_out(buffer)
+  if {![string match "*Asking Haiku*" $shown]} { fail "no spinner while waiting for: $request" }
+  if {[regexp {\[[0-9]+\]\s+[-+]?\s*([0-9]+|done)} $shown]} { fail "job-control message leaked for: $request" }
+  return $shown
 }
 
 if {[string match *zsh* $shell]} {
@@ -41,19 +54,22 @@ if {[string match *zsh* $shell]} {
 send "PS1='SHLI-''TEST> '; cd '$sandbox' && source '$src'\r"
 wait_prompt
 
-# 1. Plain request, run with ⏎.
-ask "check my kernel and os version"
+# 1. Plain request, drawn highlighted in a box, run with ⏎.
+set shown [ask "check my kernel and os version"]
+if {[string first "\033\[1;32m" $shown] < 0} { fail "no program was highlighted" }
 send "\r"
 expect {
   -re {Darwin|ProductVersion|Linux} {}
   timeout { fail "kernel command produced no kernel/OS output" }
 }
+end_followup
 wait_prompt
 pass "kernel request ran on ⏎"
 
 # 2. The command runs in this shell, so cd sticks.
 ask "go to the Downloads folder in my home directory"
 send "\r"
+end_followup
 wait_prompt
 send "pwd\r"
 expect {
@@ -109,6 +125,51 @@ expect {
 }
 wait_prompt
 pass "arrow key cancelled cleanly"
+
+# 6. ? explains each part with a second call, then the hint drops "? explain".
+ask "check if any homebrew packages need updating"
+send "?"
+expect {
+  -re {run \S+ esc cancel} {}
+  "shli: no answer" { fail "explanation call failed" }
+  timeout { fail "? did not show an explanation" }
+}
+if {![string match *brew* $expect_out(buffer)]} { fail "explanation did not mention brew" }
+send "\033"
+expect {
+  "cancelled" {}
+  timeout { fail "esc did not cancel after explaining" }
+}
+wait_prompt
+pass "? explained the command"
+
+# 7. ctrl+c while waiting stops the spinner and claude; nothing is drawn after the prompt comes back.
+# pgrep looks for any claude started by shli, so don't run two smoke tests at the same time.
+send "shli list the files in this folder\r"
+expect {
+  "Asking Haiku" {}
+  timeout { fail "spinner never appeared" }
+}
+send "\003"
+expect {
+  $prompt {}
+  timeout { fail "ctrl+c did not bring the prompt back" }
+}
+set timeout 2
+expect {
+  "Asking Haiku" { fail "spinner kept drawing after ctrl+c" }
+  timeout {}
+}
+set timeout 40
+# The strings are split so the echoed command line can't match the result.
+send "sleep 1; pgrep -f no-session-persistence >/dev/null && echo CLAUDE-''STILL-RUNNING || echo CLAUDE-''GONE\r"
+expect {
+  "CLAUDE-GONE" {}
+  "CLAUDE-STILL-RUNNING" { fail "claude kept running after ctrl+c" }
+  timeout { fail "could not check for a leftover claude" }
+}
+wait_prompt
+pass "ctrl+c stopped the spinner and claude"
 
 send "exit\r"
 expect eof
